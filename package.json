@@ -1,0 +1,13 @@
+{
+  "name": "court-clash-multiplayer-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Room-code WebSocket relay server for Court Clash basketball",
+  "main": "Court_Clash_Multiplayer_Server.js",
+  "scripts": {
+    "start": "node Court_Clash_Multiplayer_Server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
