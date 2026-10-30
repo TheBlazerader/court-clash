@@ -1,174 +1,724 @@
-'use strict';
-const http = require('http');
-const { WebSocketServer, WebSocket } = require('ws');
 
-const PORT = Number(process.env.PORT || 3000);
-const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-const MAX_SPECTATORS = 10;
-const rooms = new Map();
-const sockets = new Set();
+const http = require("http");
+const WebSocket = require("ws");
+const { randomUUID } = require("crypto");
+
+const PORT = process.env.PORT || 10000;
 
 const server = http.createServer((req, res) => {
-  if (req.url === '/' || req.url === '/health') {
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({ ok: true, service: 'Court Clash multiplayer', rooms: rooms.size }));
-    return;
-  }
-  res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
-  res.end('Not found');
-});
-const wss = new WebSocketServer({ server, maxPayload: 256 * 1024 });
+    if (req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        return res.end("Ramp Rush 3D server is running!");
+    }
 
-function send(socket, data) {
-  if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(data));
-}
-function cleanName(value, fallback) {
-  const name = String(value || '').replace(/[<>\u0000-\u001f]/g, '').trim().slice(0, 16);
-  return name || fallback;
-}
-function code() {
-  let out;
-  do {
-    out = '';
-    for (let i = 0; i < 6; i++) out += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
-  } while (rooms.has(out));
-  return out;
-}
-function broadcastSpectatorCount(room) {
-  const count = room.spectators.size;
-  send(room.host, { type: 'spectator_count', count });
-  for (const [socket] of room.spectators) send(socket, { type: 'spectator_count', count });
-}
-function closeRoom(room, reason = 'room_closed') {
-  if (!room) return;
-  rooms.delete(room.code);
-  if (room.host) { room.host.roomCode = null; room.host.role = null; }
-  if (room.guest) {
-    room.guest.roomCode = null; room.guest.role = null;
-    send(room.guest, { type: reason });
-    try { room.guest.close(1000, 'Room closed'); } catch (_) {}
-  }
-  for (const [spectator] of room.spectators) {
-    spectator.roomCode = null; spectator.role = null;
-    send(spectator, { type: reason });
-    try { spectator.close(1000, 'Room closed'); } catch (_) {}
-  }
-  room.spectators.clear();
-}
-function removeSpectator(room, socket, notify = true) {
-  const info = room.spectators.get(socket);
-  if (!info) return;
-  room.spectators.delete(socket);
-  socket.roomCode = null;
-  socket.role = null;
-  if (notify) {
-    send(room.host, { type: 'spectator_left', name: info.name, count: room.spectators.size });
-    broadcastSpectatorCount(room);
-  }
-}
-function handle(socket, msg) {
-  if (!msg || typeof msg.type !== 'string') return;
-  if (msg.type === 'create_room') {
-    if (socket.roomCode) { send(socket, { type: 'error', message: 'You are already in a room. Leave it first.' }); return; }
-    const roomCode = code();
-    const hostName = cleanName(msg.name, 'Host');
-    const room = { code: roomCode, host: socket, guest: null, hostName, guestName: 'Guest', spectators: new Map(), latestState: null, createdAt: Date.now() };
-    rooms.set(roomCode, room);
-    socket.roomCode = roomCode; socket.role = 'host';
-    send(socket, { type: 'room_created', code: roomCode, name: room.hostName });
-    return;
-  }
-  if (msg.type === 'join_room') {
-    if (socket.roomCode) { send(socket, { type: 'error', message: 'You are already in a room. Leave it first.' }); return; }
-    const roomCode = String(msg.code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const room = rooms.get(roomCode);
-    if (!room || !room.host || room.host.readyState !== WebSocket.OPEN) {
-      send(socket, { type: 'error', message: 'Room not found. Check the code and ask the host to create a room.' }); return;
-    }
-    const name = cleanName(msg.name, 'Player');
-    if (room.guest && room.guest.readyState !== WebSocket.OPEN) { room.guest.roomCode = null; room.guest.role = null; room.guest = null; room.guestName = 'Guest'; }
-    if (!room.guest) {
-      room.guest = socket; room.guestName = name;
-      socket.roomCode = roomCode; socket.role = 'guest';
-      send(socket, { type: 'room_joined', code: roomCode, hostName: room.hostName, guestName: room.guestName });
-      send(room.host, { type: 'guest_joined', code: roomCode, name: room.guestName });
-      if (room.latestState) send(socket, { type: 'game_state', state: room.latestState });
-      return;
-    }
-    if (room.spectators.size >= MAX_SPECTATORS) {
-      send(socket, { type: 'error', message: 'This room is full: 2 players and 10 spectators maximum.' }); return;
-    }
-    room.spectators.set(socket, { name, joinedAt: Date.now() });
-    socket.roomCode = roomCode; socket.role = 'spectator';
-    send(socket, { type: 'spectator_joined', role: 'spectator', code: roomCode, hostName: room.hostName, guestName: room.guestName, spectatorName: name, spectatorCount: room.spectators.size, state: room.latestState });
-    send(room.host, { type: 'spectator_joined', name, count: room.spectators.size });
-    broadcastSpectatorCount(room);
-    return;
-  }
-
-  const room = socket.roomCode ? rooms.get(socket.roomCode) : null;
-  if (!room) {
-    if (msg.type !== 'leave_room' && msg.type !== 'close_room') send(socket, { type: 'error', message: 'You are not in a room.' });
-    return;
-  }
-  if (msg.type === 'game_state' && socket.role === 'host') {
-    if (!msg.state || typeof msg.state !== 'object') return;
-    room.latestState = msg.state;
-    send(room.guest, { type: 'game_state', state: msg.state });
-    for (const [spectator] of room.spectators) send(spectator, { type: 'game_state', state: msg.state });
-    return;
-  }
-  if (msg.type === 'key_down' && socket.role === 'guest') {
-    const key = String(msg.key || '').slice(0, 20).toLowerCase(); send(room.host, { type: 'remote_key_down', key }); return;
-  }
-  if (msg.type === 'key_up' && socket.role === 'guest') {
-    const key = String(msg.key || '').slice(0, 20).toLowerCase(); send(room.host, { type: 'remote_key_up', key }); return;
-  }
-  if (msg.type === 'camera_look' && socket.role === 'guest') {
-    const yaw = Number(msg.yaw), pitch = Number(msg.pitch);
-    if (!Number.isFinite(yaw) || !Number.isFinite(pitch)) return;
-    send(room.host, { type: 'remote_camera_look', yaw: Math.max(-1000, Math.min(1000, yaw)), pitch: Math.max(-0.72, Math.min(0.72, pitch)) }); return;
-  }
-  if (msg.type === 'guest_input' && socket.role === 'guest') {
-    const yaw = Number(msg.yaw), pitch = Number(msg.pitch);
-    const allowed = new Set(['keyw', 'keya', 'keys', 'keyd', 'shiftleft', 'shiftright']);
-    const keys = Array.isArray(msg.keys) ? msg.keys.slice(0, 24).map(k => String(k).slice(0, 20).toLowerCase()).filter(k => allowed.has(k)) : [];
-    send(room.host, { type: 'remote_guest_input', keys, yaw: Number.isFinite(yaw) ? Math.max(-1000, Math.min(1000, yaw)) : 0, pitch: Number.isFinite(pitch) ? Math.max(-0.72, Math.min(0.72, pitch)) : 0 }); return;
-  }
-  if (msg.type === 'leave_room') {
-    if (socket.role === 'guest') {
-      room.guest = null; room.guestName = 'Guest'; socket.roomCode = null; socket.role = null;
-      send(room.host, { type: 'guest_left' }); send(socket, { type: 'left_room' }); return;
-    }
-    if (socket.role === 'spectator') { removeSpectator(room, socket); send(socket, { type: 'left_room' }); return; }
-  }
-  if (msg.type === 'close_room' && socket.role === 'host') { closeRoom(room); send(socket, { type: 'left_room' }); return; }
-}
-
-wss.on('connection', socket => {
-  sockets.add(socket); socket.roomCode = null; socket.role = null;
-  socket.on('message', raw => {
-    if (raw.length > 256 * 1024) return;
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch (_) { send(socket, { type: 'error', message: 'Invalid message format.' }); return; }
-    try { handle(socket, msg); } catch (err) { console.error('Message handling error:', err); send(socket, { type: 'error', message: 'The server could not process that request.' }); }
-  });
-  socket.on('close', () => {
-    sockets.delete(socket);
-    const room = socket.roomCode ? rooms.get(socket.roomCode) : null;
-    if (!room) return;
-    if (socket.role === 'host') closeRoom(room, 'room_closed');
-    else if (socket.role === 'guest') { room.guest = null; room.guestName = 'Guest'; send(room.host, { type: 'guest_left' }); }
-    else if (socket.role === 'spectator') removeSpectator(room, socket);
-  });
-  socket.on('error', err => console.error('WebSocket error:', err.message));
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("Ramp Rush 3D WebSocket server");
 });
 
-setInterval(() => {
-  const now = Date.now();
-  for (const room of rooms.values()) {
-    if (!room.host || room.host.readyState === WebSocket.CLOSED || now - room.createdAt > 12 * 60 * 60 * 1000) closeRoom(room);
-  }
-}, 60 * 1000).unref();
+// World snapshots can contain many arena objects, so allow larger messages.
+const wss = new WebSocket.Server({
+    server,
+    path: "/ws",
+    maxPayload: 1024 * 1024
+});
 
-server.listen(PORT, '0.0.0.0', () => console.log(`Court Clash multiplayer server listening on ${PORT}`));
+const players = new Map();
+let partyLeaderId = null;
+let worldState = null;
+let worldRevision = 0;
+
+// Only the party leader can change this permission.
+let allowWorldEditing = false;
+
+function send(socket, message) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify(message));
+    }
+}
+
+function broadcast(message, exceptSocket = null) {
+    const data = JSON.stringify(message);
+
+    for (const client of wss.clients) {
+        if (
+            client !== exceptSocket &&
+            client.readyState === WebSocket.OPEN
+        ) {
+            client.send(data);
+        }
+    }
+}
+
+function spawnForIndex(index) {
+    // Four-column grid, with enough space between vehicles.
+    const column = index % 4;
+    const row = Math.floor(index / 4);
+
+    return {
+        x: (column - 1.5) * 6,
+        y: 1.5,
+        z: 15 + row * 7
+    };
+}
+
+function nextSpawnIndex() {
+    const used = new Set(
+        [...players.values()].map(player => player.spawnIndex)
+    );
+
+    let index = 0;
+
+    while (used.has(index)) index++;
+
+    return index;
+}
+
+function cleanPlayer(player) {
+    return {
+        id: player.id,
+        name: player.name,
+        color: player.color,
+        vehicleType: player.vehicleType === "plane" ? "plane" : "car",
+        position: player.position,
+        quaternion: player.quaternion,
+        velocity: player.velocity,
+        spawn: player.spawn,
+        spawnIndex: player.spawnIndex
+    };
+}
+
+function validFiniteVector(value, keys) {
+    return !!value && keys.every(key => Number.isFinite(value[key]));
+}
+
+function sanitizeWorld(input) {
+    if (!Array.isArray(input) || input.length > 500) return null;
+
+    const ids = new Set();
+    const result = [];
+
+    for (const item of input) {
+        if (
+            !item ||
+            !Number.isInteger(item.id) ||
+            item.id <= 0 ||
+            ids.has(item.id)
+        ) {
+            return null;
+        }
+
+        if (item.type !== "box" && item.type !== "cylinder") {
+            return null;
+        }
+
+        if (
+            !validFiniteVector(item.position, ["x", "y", "z"]) ||
+            !validFiniteVector(item.rotation, ["x", "y", "z", "w"]) ||
+            !validFiniteVector(item.scale, ["x", "y", "z"])
+        ) {
+            return null;
+        }
+
+        if (
+            [item.position.x, item.position.y, item.position.z]
+                .some(v => Math.abs(v) > 2000)
+        ) {
+            return null;
+        }
+
+        if (
+            [item.scale.x, item.scale.y, item.scale.z]
+                .some(v => v < 0.1 || v > 50)
+        ) {
+            return null;
+        }
+
+        const color =
+            typeof item.color === "string" &&
+            /^#[0-9a-f]{6}$/i.test(item.color)
+                ? item.color.toLowerCase()
+                : "#333b49";
+
+        const safe = {
+            id: item.id,
+            name: String(item.name || `${item.type} ${item.id}`).slice(0, 80),
+            type: item.type,
+            position: {
+                x: item.position.x,
+                y: item.position.y,
+                z: item.position.z
+            },
+            rotation: {
+                x: item.rotation.x,
+                y: item.rotation.y,
+                z: item.rotation.z,
+                w: item.rotation.w
+            },
+            scale: {
+                x: item.scale.x,
+                y: item.scale.y,
+                z: item.scale.z
+            },
+            color,
+            collision: item.collision !== false,
+            baseHalfExtents: null,
+            baseRadius: null,
+            baseHeight: null
+        };
+
+        if (item.type === "box") {
+            const h = item.baseHalfExtents;
+
+            if (
+                !validFiniteVector(h, ["x", "y", "z"]) ||
+                [h.x, h.y, h.z].some(v => v <= 0 || v > 1000)
+            ) {
+                return null;
+            }
+
+            safe.baseHalfExtents = {
+                x: h.x,
+                y: h.y,
+                z: h.z
+            };
+        } else {
+            if (
+                !Number.isFinite(item.baseRadius) ||
+                !Number.isFinite(item.baseHeight) ||
+                item.baseRadius <= 0 ||
+                item.baseRadius > 1000 ||
+                item.baseHeight <= 0 ||
+                item.baseHeight > 1000
+            ) {
+                return null;
+            }
+
+            safe.baseRadius = item.baseRadius;
+            safe.baseHeight = item.baseHeight;
+        }
+
+        ids.add(item.id);
+        result.push(safe);
+    }
+
+    return result;
+}
+
+function respawnEveryoneOnGrid() {
+    let index = 0;
+
+    for (const player of players.values()) {
+        player.spawnIndex = index;
+        player.spawn = spawnForIndex(index);
+        player.position = { ...player.spawn };
+        player.quaternion = {
+            x: 0,
+            y: 0,
+            z: 0,
+            w: 1
+        };
+        player.velocity = {
+            x: 0,
+            y: 0,
+            z: 0
+        };
+
+        index++;
+    }
+}
+
+wss.on("connection", socket => {
+    const id = randomUUID();
+
+    socket.playerId = id;
+    socket.isAlive = true;
+    socket.lastCollisionAt = 0;
+    socket.lastChatAt = 0;
+
+    socket.on("pong", () => {
+        socket.isAlive = true;
+    });
+
+    socket.on("message", rawMessage => {
+        let message;
+
+        try {
+            message = JSON.parse(rawMessage.toString());
+        } catch {
+            send(socket, {
+                type: "error",
+                message: "Invalid JSON message."
+            });
+            return;
+        }
+
+        if (!message || typeof message.type !== "string") return;
+
+        // PLAYER JOIN
+        if (message.type === "join") {
+            if (players.has(id)) return;
+
+            if (players.size === 0) {
+                partyLeaderId = id;
+
+                if (worldState === null) {
+                    worldRevision = 0;
+                }
+            }
+
+            const name =
+                typeof message.name === "string"
+                    ? message.name.trim().slice(0, 20)
+                    : "";
+
+            const color =
+                typeof message.color === "string" &&
+                /^#[0-9a-f]{6}$/i.test(message.color)
+                    ? message.color.toLowerCase()
+                    : "#e82e42";
+
+            const spawnIndex = nextSpawnIndex();
+            const spawn = spawnForIndex(spawnIndex);
+
+            const player = {
+                id,
+                name: name || "Player",
+                color,
+                vehicleType: "car",
+                position: { ...spawn },
+                quaternion: {
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                    w: 1
+                },
+                velocity: {
+                    x: 0,
+                    y: 0,
+                    z: 0
+                },
+                spawn,
+                spawnIndex
+            };
+
+            players.set(id, player);
+
+            send(socket, {
+                type: "welcome",
+                id,
+                leaderId: partyLeaderId,
+                isLeader: partyLeaderId === id,
+                player: cleanPlayer(player),
+                spawn,
+                players: [...players.values()]
+                    .filter(other => other.id !== id)
+                    .map(cleanPlayer),
+                world: worldState,
+                worldRevision,
+                allowWorldEditing
+            });
+
+            broadcast({
+                type: "player_joined",
+                player: cleanPlayer(player),
+                leaderId: partyLeaderId
+            }, socket);
+
+            console.log(
+                `${player.name} joined (${id})` +
+                `${partyLeaderId === id ? " as party leader" : ""}`
+            );
+
+            return;
+        }
+
+        if (!players.has(id)) return;
+
+        // PLAYER STATE
+        if (message.type === "player_state") {
+            const p = message.position;
+            const q = message.quaternion;
+
+            if (
+                !validFiniteVector(p, ["x", "y", "z"]) ||
+                !validFiniteVector(q, ["x", "y", "z", "w"])
+            ) {
+                return;
+            }
+
+            const player = players.get(id);
+
+            player.name =
+                typeof message.name === "string"
+                    ? message.name.trim().slice(0, 20) || "Player"
+                    : player.name;
+
+            if (
+                typeof message.color === "string" &&
+                /^#[0-9a-f]{6}$/i.test(message.color)
+            ) {
+                player.color = message.color.toLowerCase();
+            }
+
+            player.vehicleType =
+                message.vehicleType === "plane" ? "plane" : "car";
+
+            player.position = {
+                x: p.x,
+                y: p.y,
+                z: p.z
+            };
+
+            player.quaternion = {
+                x: q.x,
+                y: q.y,
+                z: q.z,
+                w: q.w
+            };
+
+            if (
+                message.velocity &&
+                validFiniteVector(message.velocity, ["x", "y", "z"])
+            ) {
+                player.velocity = {
+                    x: Math.max(-150, Math.min(150, message.velocity.x)),
+                    y: Math.max(-150, Math.min(150, message.velocity.y)),
+                    z: Math.max(-150, Math.min(150, message.velocity.z))
+                };
+            }
+
+            broadcast({
+                type: "player_state",
+                player: cleanPlayer(player)
+            }, socket);
+
+            return;
+        }
+
+        // CHAT
+        if (message.type === "chat_message") {
+            const now = Date.now();
+
+            if (now - socket.lastChatAt < 300) return;
+
+            const text =
+                typeof message.text === "string"
+                    ? message.text.trim().slice(0, 200)
+                    : "";
+
+            if (!text) return;
+
+            socket.lastChatAt = now;
+
+            const player = players.get(id);
+
+            broadcast({
+                type: "chat_message",
+                id,
+                name: player.name,
+                text,
+                timestamp: now
+            });
+
+            return;
+        }
+
+        // VEHICLE COLLISION RELAY
+        if (message.type === "collision") {
+            const now = Date.now();
+
+            if (now - socket.lastCollisionAt < 180) return;
+
+            const targetId = String(message.targetId || "");
+            const impulse = message.impulse;
+
+            if (
+                !players.has(targetId) ||
+                targetId === id ||
+                !validFiniteVector(impulse, ["x", "y", "z"])
+            ) {
+                return;
+            }
+
+            const magnitude = Math.hypot(
+                impulse.x,
+                impulse.y,
+                impulse.z
+            );
+
+            if (magnitude < 500 || magnitude > 18000) return;
+
+            socket.lastCollisionAt = now;
+
+            const targetSocket = [...wss.clients].find(
+                client => client.playerId === targetId
+            );
+
+            if (targetSocket) {
+                send(targetSocket, {
+                    type: "collision",
+                    sourceId: id,
+                    targetId,
+                    impulse
+                });
+            }
+
+            return;
+        }
+
+        // KICK PLAYER — PARTY LEADER ONLY
+        if (message.type === "kick_request") {
+            const requestId =
+                typeof message.requestId === "string"
+                    ? message.requestId.slice(0, 100)
+                    : "";
+
+            const targetId =
+                typeof message.targetId === "string"
+                    ? message.targetId
+                    : "";
+
+            const reply = (success, details = {}) => {
+                send(socket, {
+                    type: "kick_response",
+                    requestId,
+                    targetId,
+                    success,
+                    ...details
+                });
+            };
+
+            if (id !== partyLeaderId || !players.has(id)) {
+                reply(false, {
+                    message: "Only the current party leader can remove players."
+                });
+                return;
+            }
+
+            if (!targetId || targetId === id) {
+                reply(false, {
+                    message: "Choose another player in the lobby."
+                });
+                return;
+            }
+
+            const targetPlayer = players.get(targetId);
+
+            if (!targetPlayer) {
+                reply(false, {
+                    message: "That player is no longer in the lobby. Refresh the player list and try again."
+                });
+                return;
+            }
+
+            const targetSocket = [...wss.clients].find(client =>
+                String(client.playerId || "") === targetId &&
+                client.readyState === WebSocket.OPEN
+            );
+
+            if (!targetSocket) {
+                players.delete(targetId);
+
+                broadcast({
+                    type: "player_left",
+                    id: targetId,
+                    name: targetPlayer.name,
+                    leaderId: partyLeaderId
+                });
+
+                reply(false, {
+                    message: "The player connection was already closed; their stale lobby entry was removed."
+                });
+
+                return;
+            }
+
+            send(targetSocket, {
+                type: "removed_from_lobby",
+                reason: "The party leader removed you from the lobby."
+            });
+
+            players.delete(targetId);
+
+            broadcast({
+                type: "player_left",
+                id: targetId,
+                name: targetPlayer.name,
+                leaderId: partyLeaderId
+            });
+
+            reply(true, {
+                name: targetPlayer.name
+            });
+
+            setTimeout(() => {
+                try {
+                    if (
+                        targetSocket.readyState === WebSocket.OPEN ||
+                        targetSocket.readyState === WebSocket.CONNECTING
+                    ) {
+                        targetSocket.close(
+                            4001,
+                            "Removed from lobby by party leader"
+                        );
+                    }
+                } catch (_) {}
+            }, 100);
+
+            console.log(
+                `${targetPlayer.name} was removed from the lobby by ` +
+                `${players.get(id)?.name || "party leader"} (${targetId})`
+            );
+
+            return;
+        }
+
+        // WORLD EDITING PERMISSION — PARTY LEADER ONLY
+        if (message.type === "set_world_edit_permission") {
+            if (id !== partyLeaderId) {
+                send(socket, {
+                    type: "error",
+                    message: "Only the party leader can change world-editing permission."
+                });
+
+                return;
+            }
+
+            allowWorldEditing = message.enabled === true;
+
+            broadcast({
+                type: "world_edit_permission",
+                allowWorldEditing,
+                leaderId: partyLeaderId
+            });
+
+            console.log(
+                `World editing for all players ` +
+                `${allowWorldEditing ? "enabled" : "disabled"} by ` +
+                `${players.get(id)?.name || id}.`
+            );
+
+            return;
+        }
+
+        // PUBLISH WORLD CHANGES
+        if (message.type === "world_commit") {
+            if (id !== partyLeaderId && !allowWorldEditing) {
+                send(socket, {
+                    type: "error",
+                    message: "Only the party leader can publish arena changes unless the leader has enabled editing for everyone."
+                });
+
+                return;
+            }
+
+            const sanitized = sanitizeWorld(message.world);
+
+            if (!sanitized) {
+                send(socket, {
+                    type: "error",
+                    message: "Arena update rejected: invalid object data, duplicate IDs, or more than 500 objects. No changes were published."
+                });
+
+                console.warn(
+                    `Rejected arena publish from ${players.get(id)?.name || id}.`
+                );
+
+                return;
+            }
+
+            worldState = sanitized;
+            worldRevision++;
+
+            respawnEveryoneOnGrid();
+
+            const currentPlayers = [...players.values()].map(cleanPlayer);
+
+            broadcast({
+                type: "world_committed",
+                revision: worldRevision,
+                leaderId: partyLeaderId,
+                world: worldState,
+                players: currentPlayers
+            });
+
+            send(socket, {
+                type: "world_commit_ack",
+                revision: worldRevision,
+                objectCount: worldState.length
+            });
+
+            console.log(
+                `Arena revision ${worldRevision} published by ` +
+                `${players.get(id).name} (${worldState.length} objects); ` +
+                `respawned ${players.size} player(s).`
+            );
+
+            return;
+        }
+    });
+
+    // PLAYER DISCONNECT
+    socket.on("close", () => {
+        const player = players.get(id);
+
+        if (!player) return;
+
+        players.delete(id);
+
+        if (players.size === 0) {
+            allowWorldEditing = false;
+        }
+
+        const wasLeader = partyLeaderId === id;
+
+        if (wasLeader) {
+            partyLeaderId = players.size
+                ? players.keys().next().value
+                : null;
+        }
+
+        broadcast({
+            type: "player_left",
+            id,
+            name: player.name,
+            leaderId: partyLeaderId
+        });
+
+        if (wasLeader && partyLeaderId) {
+            broadcast({
+                type: "leader_changed",
+                leaderId: partyLeaderId
+            });
+
+            console.log(
+                `${players.get(partyLeaderId)?.name || "A player"} is the new party leader.`
+            );
+        }
+
+        console.log(`${player.name} left (${id})`);
+    });
+
+    socket.on("error", error => {
+        console.error("WebSocket error:", error.message);
+    });
+});
+
+// CONNECTION HEARTBEAT
+const heartbeat = setInterval(() => {
+    for (const socket of wss.clients) {
+        if (!socket.isAlive) {
+            socket.terminate();
+            continue;
+        }
+
+        socket.isAlive = false;
+        socket.ping();
+    }
+}, 30000);
+
+server.on("close", () => clearInterval(heartbeat));
+
+server.listen(PORT, "0.0.0.0", () => {
+    console.log(`Ramp Rush 3D server listening on port ${PORT}`);
+});
