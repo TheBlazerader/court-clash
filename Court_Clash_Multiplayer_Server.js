@@ -1,3 +1,4 @@
+
 const http = require("http");
 const WebSocket = require("ws");
 const { randomUUID } = require("crypto");
@@ -19,7 +20,7 @@ const players = new Map();
 let partyLeaderId = null;
 let worldState = null;
 let worldRevision = 0;
-let allowWorldEditing = false;
+let allowAnyoneEdit = false;
 
 function send(socket, message) {
     if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
@@ -174,9 +175,9 @@ wss.on("connection", socket => {
                 players: [...players.values()].filter(other => other.id !== id).map(cleanPlayer),
                 world: worldState,
                 worldRevision,
-                allowWorldEditing
+                allowAnyoneEdit
             });
-            broadcast({ type: "player_joined", player: cleanPlayer(player), leaderId: partyLeaderId, allowWorldEditing });
+            broadcast({ type: "player_joined", player: cleanPlayer(player), leaderId: partyLeaderId }, socket);
             console.log(`${player.name} joined (${id})${partyLeaderId === id ? " as party leader" : ""}`);
             return;
         }
@@ -204,29 +205,6 @@ wss.on("connection", socket => {
             return;
         }
 
-        if (message.type === "set_world_edit_permission") {
-            if (id !== partyLeaderId) {
-                send(socket, { type: "error", message: "Only the party leader can change world-edit permissions." });
-                return;
-            }
-            allowWorldEditing = message.enabled === true;
-            const permissionUpdate = {
-                type: "world_edit_permission",
-                enabled: allowWorldEditing,
-                leaderId: partyLeaderId
-            };
-            // Send the authoritative update to every connected player, including the leader.
-            broadcast(permissionUpdate, socket);
-            // Explicit acknowledgement lets the leader confirm the server accepted the toggle.
-            send(socket, {
-                type: "world_edit_permission_ack",
-                enabled: allowWorldEditing,
-                leaderId: partyLeaderId
-            });
-            console.log(`World editing for everyone ${allowWorldEditing ? "enabled" : "disabled"} by ${players.get(id)?.name || id}.`);
-            return;
-        }
-
         if (message.type === "chat_message") {
             const now = Date.now();
             if (now - socket.lastChatAt < 300) return;
@@ -238,17 +216,29 @@ wss.on("connection", socket => {
             return;
         }
 
-        if (message.type === "collision") {
+        if (message.type === "car_collision") {
             const now = Date.now();
-            if (now - socket.lastCollisionAt < 180) return;
+            if (now - socket.lastCollisionAt < 700) return;
             const targetId = String(message.targetId || "");
-            const impulse = message.impulse;
-            if (!players.has(targetId) || targetId === id || !validFiniteVector(impulse, ["x", "y", "z"])) return;
-            const magnitude = Math.hypot(impulse.x, impulse.y, impulse.z);
-            if (magnitude < 500 || magnitude > 18000) return;
+            const sourcePlayer = players.get(id);
+            const targetPlayer = players.get(targetId);
+            const relativeSpeed = Number(message.relativeSpeed);
+            if (!sourcePlayer || !targetPlayer || targetId === id || sourcePlayer.vehicleType !== "car" || targetPlayer.vehicleType !== "car") return;
+            if (!Number.isFinite(relativeSpeed) || relativeSpeed < 5.5 || relativeSpeed > 200) return;
             socket.lastCollisionAt = now;
             const targetSocket = [...wss.clients].find(client => client.playerId === targetId);
-            if (targetSocket) send(targetSocket, { type: "collision", sourceId: id, targetId, impulse });
+            if (targetSocket) send(targetSocket, { type: "car_explosion", sourceId: id, targetId, respawnDelay: 1000 });
+            return;
+        }
+
+        if (message.type === "set_editor_permission") {
+            if (id !== partyLeaderId) {
+                send(socket, { type: "error", message: "Only the party leader can change world editing permissions." });
+                return;
+            }
+            allowAnyoneEdit = message.allowAnyoneEdit === true;
+            broadcast({ type: "editor_permission", allowAnyoneEdit, leaderId: partyLeaderId });
+            console.log(`World editing is now ${allowAnyoneEdit ? "open to all party members" : "leader-only"}.`);
             return;
         }
 
@@ -309,8 +299,8 @@ wss.on("connection", socket => {
         }
 
         if (message.type === "world_commit") {
-            if (id !== partyLeaderId && !allowWorldEditing) {
-                send(socket, { type: "error", message: "Only the party leader can publish arena changes unless world editing for everyone is enabled." });
+            if (id !== partyLeaderId && !allowAnyoneEdit) {
+                send(socket, { type: "error", message: "World editing is currently limited to the party leader." });
                 return;
             }
             const sanitized = sanitizeWorld(message.world);
@@ -329,6 +319,7 @@ wss.on("connection", socket => {
                 type: "world_committed",
                 revision: worldRevision,
                 leaderId: partyLeaderId,
+                allowAnyoneEdit,
                 world: worldState,
                 players: currentPlayers
             });
@@ -351,10 +342,9 @@ wss.on("connection", socket => {
         // never reach this state.
         broadcast({ type: "player_left", id, name: player.name, leaderId: partyLeaderId });
         if (wasLeader && partyLeaderId) {
-            broadcast({ type: "leader_changed", leaderId: partyLeaderId, allowWorldEditing });
+            broadcast({ type: "leader_changed", leaderId: partyLeaderId, allowAnyoneEdit });
             console.log(`${players.get(partyLeaderId)?.name || "A player"} is the new party leader.`);
         }
-        if (players.size === 0) allowWorldEditing = false;
         console.log(`${player.name} left (${id})`);
     });
 
