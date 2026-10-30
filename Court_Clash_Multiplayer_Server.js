@@ -116,6 +116,15 @@ function handle(socket, msg) {
     send(room.host, { type: 'remote_camera_look', yaw: Math.max(-1000, Math.min(1000, yaw)), pitch: Math.max(-0.72, Math.min(0.72, pitch)) });
     return;
   }
+  // Continuous guest movement heartbeat. This recovers from missed keydown/keyup events.
+  if (msg.type === 'guest_input' && socket.role === 'guest') {
+    const yaw = Number(msg.yaw);
+    const pitch = Number(msg.pitch);
+    const allowed = new Set(['keyw', 'keya', 'keys', 'keyd', 'shiftleft', 'shiftright']);
+    const keys = Array.isArray(msg.keys) ? msg.keys.slice(0, 24).map(k => String(k).slice(0, 20).toLowerCase()).filter(k => allowed.has(k)) : [];
+    send(room.host, { type: 'remote_guest_input', keys, yaw: Number.isFinite(yaw) ? Math.max(-1000, Math.min(1000, yaw)) : 0, pitch: Number.isFinite(pitch) ? Math.max(-0.72, Math.min(0.72, pitch)) : 0 });
+    return;
+  }
   if (msg.type === 'leave_room' && socket.role === 'guest') {
     room.guest = null;
     room.guestName = 'Guest';
