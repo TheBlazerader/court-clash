@@ -21,6 +21,10 @@ const wss = new WebSocketServer({ server, maxPayload: 256 * 1024 });
 function send(socket, data) {
   if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(data));
 }
+function cleanName(value, fallback) {
+  const name = String(value || '').replace(/[<>\u0000-\u001f]/g, '').trim().slice(0, 16);
+  return name || fallback;
+}
 function code() {
   let out;
   do {
@@ -51,11 +55,12 @@ function handle(socket, msg) {
       return;
     }
     const roomCode = code();
-    const room = { code: roomCode, host: socket, guest: null, latestState: null, createdAt: Date.now() };
+    const hostName = cleanName(msg.name, 'Host');
+    const room = { code: roomCode, host: socket, guest: null, hostName, guestName: 'Guest', latestState: null, createdAt: Date.now() };
     rooms.set(roomCode, room);
     socket.roomCode = roomCode;
     socket.role = 'host';
-    send(socket, { type: 'room_created', code: roomCode });
+    send(socket, { type: 'room_created', code: roomCode, name: room.hostName });
     return;
   }
   if (msg.type === 'join_room') {
@@ -74,10 +79,11 @@ function handle(socket, msg) {
       return;
     }
     room.guest = socket;
+    room.guestName = cleanName(msg.name, 'Guest');
     socket.roomCode = roomCode;
     socket.role = 'guest';
-    send(socket, { type: 'room_joined', code: roomCode });
-    send(room.host, { type: 'guest_joined', code: roomCode });
+    send(socket, { type: 'room_joined', code: roomCode, hostName: room.hostName, guestName: room.guestName });
+    send(room.host, { type: 'guest_joined', code: roomCode, name: room.guestName });
     if (room.latestState) send(socket, { type: 'game_state', state: room.latestState });
     return;
   }
@@ -105,6 +111,7 @@ function handle(socket, msg) {
   }
   if (msg.type === 'leave_room' && socket.role === 'guest') {
     room.guest = null;
+    room.guestName = 'Guest';
     socket.roomCode = null;
     socket.role = null;
     send(room.host, { type: 'guest_left' });
@@ -136,6 +143,7 @@ wss.on('connection', socket => {
       closeRoom(room, 'room_closed');
     } else if (socket.role === 'guest') {
       room.guest = null;
+      room.guestName = 'Guest';
       send(room.host, { type: 'guest_left' });
     }
   });
