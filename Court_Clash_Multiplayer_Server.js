@@ -308,8 +308,16 @@ wss.on("connection", socket => {
                 send(socket, { type: "error", message: "Only the party leader can change world editing permissions." });
                 return;
             }
-            anyoneCanEditWorld = message.enabled === true;
-            broadcast({ type: "world_edit_permission", enabled: anyoneCanEditWorld });
+            const nextPermission = message.enabled === true;
+            if (nextPermission === anyoneCanEditWorld) return;
+            anyoneCanEditWorld = nextPermission;
+            const leader = players.get(id);
+            broadcast({
+                type: "world_edit_permission",
+                enabled: anyoneCanEditWorld,
+                changedBy: leader ? leader.name : "Party leader"
+            });
+            console.log(`World editing ${anyoneCanEditWorld ? "opened to everyone" : "restricted to the party leader"} by ${leader ? leader.name : id}.`);
             return;
         }
 
