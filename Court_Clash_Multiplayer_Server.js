@@ -109,6 +109,13 @@ function handle(socket, msg) {
     send(room.host, { type: 'remote_key_up', key });
     return;
   }
+  if (msg.type === 'camera_look' && socket.role === 'guest') {
+    const yaw = Number(msg.yaw);
+    const pitch = Number(msg.pitch);
+    if (!Number.isFinite(yaw) || !Number.isFinite(pitch)) return;
+    send(room.host, { type: 'remote_camera_look', yaw: Math.max(-1000, Math.min(1000, yaw)), pitch: Math.max(-0.72, Math.min(0.72, pitch)) });
+    return;
+  }
   if (msg.type === 'leave_room' && socket.role === 'guest') {
     room.guest = null;
     room.guestName = 'Guest';
