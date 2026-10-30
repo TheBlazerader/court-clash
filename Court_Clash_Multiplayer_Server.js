@@ -176,7 +176,7 @@ wss.on("connection", socket => {
                 worldRevision,
                 allowWorldEditing
             });
-            broadcast({ type: "player_joined", player: cleanPlayer(player), leaderId: partyLeaderId }, socket);
+            broadcast({ type: "player_joined", player: cleanPlayer(player), leaderId: partyLeaderId, allowWorldEditing });
             console.log(`${player.name} joined (${id})${partyLeaderId === id ? " as party leader" : ""}`);
             return;
         }
@@ -210,7 +210,19 @@ wss.on("connection", socket => {
                 return;
             }
             allowWorldEditing = message.enabled === true;
-            broadcast({ type: "world_edit_permission", enabled: allowWorldEditing, leaderId: partyLeaderId });
+            const permissionUpdate = {
+                type: "world_edit_permission",
+                enabled: allowWorldEditing,
+                leaderId: partyLeaderId
+            };
+            // Send the authoritative update to every connected player, including the leader.
+            broadcast(permissionUpdate, socket);
+            // Explicit acknowledgement lets the leader confirm the server accepted the toggle.
+            send(socket, {
+                type: "world_edit_permission_ack",
+                enabled: allowWorldEditing,
+                leaderId: partyLeaderId
+            });
             console.log(`World editing for everyone ${allowWorldEditing ? "enabled" : "disabled"} by ${players.get(id)?.name || id}.`);
             return;
         }
@@ -339,7 +351,7 @@ wss.on("connection", socket => {
         // never reach this state.
         broadcast({ type: "player_left", id, name: player.name, leaderId: partyLeaderId });
         if (wasLeader && partyLeaderId) {
-            broadcast({ type: "leader_changed", leaderId: partyLeaderId });
+            broadcast({ type: "leader_changed", leaderId: partyLeaderId, allowWorldEditing });
             console.log(`${players.get(partyLeaderId)?.name || "A player"} is the new party leader.`);
         }
         if (players.size === 0) allowWorldEditing = false;
