@@ -1,4 +1,3 @@
-
 const http = require("http");
 const WebSocket = require("ws");
 const { randomUUID } = require("crypto");
@@ -20,7 +19,9 @@ const players = new Map();
 let partyLeaderId = null;
 let worldState = null;
 let worldRevision = 0;
-let allowAnyoneEdit = false;
+let anyoneCanEditWorld = false;
+const collisionRespawnTimers = new Map();
+const collisionPairCooldowns = new Map();
 
 function send(socket, message) {
     if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
@@ -56,7 +57,7 @@ function cleanPlayer(player) {
         id: player.id,
         name: player.name,
         color: player.color,
-        vehicleType: player.vehicleType === "plane" ? "plane" : "car",
+        vehicleType: ["plane", "motorcycle"].includes(player.vehicleType) ? player.vehicleType : "car",
         position: player.position,
         quaternion: player.quaternion,
         velocity: player.velocity,
@@ -175,7 +176,7 @@ wss.on("connection", socket => {
                 players: [...players.values()].filter(other => other.id !== id).map(cleanPlayer),
                 world: worldState,
                 worldRevision,
-                allowAnyoneEdit
+                anyoneCanEditWorld
             });
             broadcast({ type: "player_joined", player: cleanPlayer(player), leaderId: partyLeaderId }, socket);
             console.log(`${player.name} joined (${id})${partyLeaderId === id ? " as party leader" : ""}`);
@@ -191,7 +192,7 @@ wss.on("connection", socket => {
             const player = players.get(id);
             player.name = typeof message.name === "string" ? message.name.trim().slice(0, 20) || "Player" : player.name;
             if (typeof message.color === "string" && /^#[0-9a-f]{6}$/i.test(message.color)) player.color = message.color.toLowerCase();
-            player.vehicleType = message.vehicleType === "plane" ? "plane" : "car";
+            player.vehicleType = ["plane", "motorcycle"].includes(message.vehicleType) ? message.vehicleType : "car";
             player.position = { x: p.x, y: p.y, z: p.z };
             player.quaternion = { x: q.x, y: q.y, z: q.z, w: q.w };
             if (message.velocity && validFiniteVector(message.velocity, ["x", "y", "z"])) {
@@ -216,29 +217,33 @@ wss.on("connection", socket => {
             return;
         }
 
-        if (message.type === "car_collision") {
+        if (message.type === "collision") {
             const now = Date.now();
-            if (now - socket.lastCollisionAt < 700) return;
+            if (now - socket.lastCollisionAt < 180) return;
             const targetId = String(message.targetId || "");
-            const sourcePlayer = players.get(id);
-            const targetPlayer = players.get(targetId);
-            const relativeSpeed = Number(message.relativeSpeed);
-            if (!sourcePlayer || !targetPlayer || targetId === id || sourcePlayer.vehicleType !== "car" || targetPlayer.vehicleType !== "car") return;
-            if (!Number.isFinite(relativeSpeed) || relativeSpeed < 5.5 || relativeSpeed > 200) return;
+            const impulse = message.impulse;
+            if (!players.has(targetId) || targetId === id || !validFiniteVector(impulse, ["x", "y", "z"])) return;
+            const magnitude = Math.hypot(impulse.x, impulse.y, impulse.z);
+            const pairKey = [id, targetId].sort().join(":");
+            if (magnitude < 500 || magnitude > 18000 || collisionRespawnTimers.has(targetId) || collisionPairCooldowns.has(pairKey)) return;
             socket.lastCollisionAt = now;
-            const targetSocket = [...wss.clients].find(client => client.playerId === targetId);
-            if (targetSocket) send(targetSocket, { type: "car_explosion", sourceId: id, targetId, respawnDelay: 1000 });
-            return;
-        }
+            const pairTimer = setTimeout(() => collisionPairCooldowns.delete(pairKey), 1200);
+            collisionPairCooldowns.set(pairKey, pairTimer);
+            const targetSocket = [...wss.clients].find(client => client.playerId === targetId && client.readyState === WebSocket.OPEN);
+            if (!targetSocket) return;
 
-        if (message.type === "set_editor_permission") {
-            if (id !== partyLeaderId) {
-                send(socket, { type: "error", message: "Only the party leader can change world editing permissions." });
-                return;
-            }
-            allowAnyoneEdit = message.allowAnyoneEdit === true;
-            broadcast({ type: "editor_permission", allowAnyoneEdit, leaderId: partyLeaderId });
-            console.log(`World editing is now ${allowAnyoneEdit ? "open to all party members" : "leader-only"}.`);
+            broadcast({ type: "collision_explode", sourceId: id, targetId });
+            const timer = setTimeout(() => {
+                collisionRespawnTimers.delete(targetId);
+                const targetPlayer = players.get(targetId);
+                if (!targetPlayer) return;
+                targetPlayer.position = { ...targetPlayer.spawn };
+                targetPlayer.quaternion = { x: 0, y: 0, z: 0, w: 1 };
+                targetPlayer.velocity = { x: 0, y: 0, z: 0 };
+                broadcast({ type: "player_respawn", id: targetId, spawn: targetPlayer.spawn });
+                broadcast({ type: "player_state", player: cleanPlayer(targetPlayer) });
+            }, 1000);
+            collisionRespawnTimers.set(targetId, timer);
             return;
         }
 
@@ -298,8 +303,18 @@ wss.on("connection", socket => {
             return;
         }
 
+        if (message.type === "world_edit_permission") {
+            if (id !== partyLeaderId) {
+                send(socket, { type: "error", message: "Only the party leader can change world editing permissions." });
+                return;
+            }
+            anyoneCanEditWorld = message.enabled === true;
+            broadcast({ type: "world_edit_permission", enabled: anyoneCanEditWorld });
+            return;
+        }
+
         if (message.type === "world_commit") {
-            if (id !== partyLeaderId && !allowAnyoneEdit) {
+            if (id !== partyLeaderId && !anyoneCanEditWorld) {
                 send(socket, { type: "error", message: "World editing is currently limited to the party leader." });
                 return;
             }
@@ -319,7 +334,6 @@ wss.on("connection", socket => {
                 type: "world_committed",
                 revision: worldRevision,
                 leaderId: partyLeaderId,
-                allowAnyoneEdit,
                 world: worldState,
                 players: currentPlayers
             });
@@ -333,6 +347,9 @@ wss.on("connection", socket => {
         const player = players.get(id);
         if (!player) return;
         players.delete(id);
+        const pendingRespawn = collisionRespawnTimers.get(id);
+        if (pendingRespawn) clearTimeout(pendingRespawn);
+        collisionRespawnTimers.delete(id);
         const wasLeader = partyLeaderId === id;
         if (wasLeader) {
             partyLeaderId = players.size ? players.keys().next().value : null;
@@ -342,9 +359,10 @@ wss.on("connection", socket => {
         // never reach this state.
         broadcast({ type: "player_left", id, name: player.name, leaderId: partyLeaderId });
         if (wasLeader && partyLeaderId) {
-            broadcast({ type: "leader_changed", leaderId: partyLeaderId, allowAnyoneEdit });
+            broadcast({ type: "leader_changed", leaderId: partyLeaderId });
             console.log(`${players.get(partyLeaderId)?.name || "A player"} is the new party leader.`);
         }
+        if (players.size === 0) anyoneCanEditWorld = false;
         console.log(`${player.name} left (${id})`);
     });
 
