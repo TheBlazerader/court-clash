@@ -19,7 +19,7 @@ const players = new Map();
 let partyLeaderId = null;
 let worldState = null;
 let worldRevision = 0;
-let anyoneCanEditWorld = false;
+let everyoneCanEditWorld = false;
 const collisionRespawnTimers = new Map();
 const collisionPairCooldowns = new Map();
 
@@ -176,7 +176,7 @@ wss.on("connection", socket => {
                 players: [...players.values()].filter(other => other.id !== id).map(cleanPlayer),
                 world: worldState,
                 worldRevision,
-                anyoneCanEditWorld
+                everyoneCanEditWorld
             });
             broadcast({ type: "player_joined", player: cleanPlayer(player), leaderId: partyLeaderId }, socket);
             console.log(`${player.name} joined (${id})${partyLeaderId === id ? " as party leader" : ""}`);
@@ -303,26 +303,30 @@ wss.on("connection", socket => {
             return;
         }
 
-        if (message.type === "world_edit_permission") {
+        if (message.type === "world_edit_permissions_request") {
+            // Permission changes follow the same authoritative pattern as an arena
+            // change: validate the leader, update server state, then broadcast one
+            // event that every connected client handles identically.
             if (id !== partyLeaderId) {
-                send(socket, { type: "error", message: "Only the party leader can change world editing permissions." });
+                send(socket, { type: "error", message: "Only the party leader can change world edit permissions." });
                 return;
             }
-            const nextPermission = message.enabled === true;
-            if (nextPermission === anyoneCanEditWorld) return;
-            anyoneCanEditWorld = nextPermission;
+            const nextPermission = message.everyoneCanEdit === true;
+            if (nextPermission === everyoneCanEditWorld) return;
+            everyoneCanEditWorld = nextPermission;
             const leader = players.get(id);
             broadcast({
-                type: "world_edit_permission",
-                enabled: anyoneCanEditWorld,
-                changedBy: leader ? leader.name : "Party leader"
+                type: "world_edit_permissions_changed",
+                everyoneCanEdit: everyoneCanEditWorld,
+                changedBy: leader ? leader.name : "The party leader",
+                leaderId: partyLeaderId
             });
-            console.log(`World editing ${anyoneCanEditWorld ? "opened to everyone" : "restricted to the party leader"} by ${leader ? leader.name : id}.`);
+            console.log(`World editing ${everyoneCanEditWorld ? "opened to everyone" : "restricted to the party leader"} by ${leader ? leader.name : id}.`);
             return;
         }
 
         if (message.type === "world_commit") {
-            if (id !== partyLeaderId && !anyoneCanEditWorld) {
+            if (id !== partyLeaderId && !everyoneCanEditWorld) {
                 send(socket, { type: "error", message: "World editing is currently limited to the party leader." });
                 return;
             }
@@ -370,7 +374,7 @@ wss.on("connection", socket => {
             broadcast({ type: "leader_changed", leaderId: partyLeaderId });
             console.log(`${players.get(partyLeaderId)?.name || "A player"} is the new party leader.`);
         }
-        if (players.size === 0) anyoneCanEditWorld = false;
+        if (players.size === 0) everyoneCanEditWorld = false;
         console.log(`${player.name} left (${id})`);
     });
 
